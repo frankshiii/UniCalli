@@ -7,6 +7,10 @@ import gradio as gr
 from inference import CalligraphyGenerator
 import json
 import csv
+import os
+from src.flux.runtime import resolve_device
+
+DEVICE = resolve_device(os.environ.get("UNICALLI_DEVICE", "auto"))
 
 # Load author and font mappings from CSV
 def load_author_fonts_from_csv(csv_path):
@@ -73,8 +77,8 @@ def init_generator(use_4bit: bool = False):
         
         generator = CalligraphyGenerator(
             model_name="flux-dev",
-            device="cuda",
-            offload=False,
+            device=DEVICE,
+            offload=DEVICE.type == "mps",
             intern_vlm_path=intern_vlm_path,
             checkpoint_path=checkpoint_path,
             font_descriptions_path='dataset/chirography.json',
@@ -239,7 +243,8 @@ with gr.Blocks(title="UniCalli - Chinese Calligraphy Generator / 中国书法生
             
             use_4bit = gr.Checkbox(
                 label="4bit量化 / 4-bit Quantization",
-                value=True,
+                value=DEVICE.type == "cuda",
+                interactive=DEVICE.type == "cuda",
                 info="勾选后VRAM仅需18G，但质量会轻微下降 / Checked: only 18G VRAM needed, slight quality reduction"
             )
             

@@ -41,6 +41,9 @@ For academic research and non-commercial use only.
 
 ## 快速开始
 
+Apple Silicon 的实验性推理入口、安装步骤和验证范围见
+[macOS / MPS 说明](docs/macos.md)。完整预训练模型推理尚未验证。
+
 ### 安装
 
 ```bash
