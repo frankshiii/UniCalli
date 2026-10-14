@@ -1,5 +1,7 @@
 """Device helpers shared by the inference entry points."""
 
+from collections.abc import Mapping
+
 import torch
 
 
@@ -44,4 +46,49 @@ def assign_checkpoint(model, state_dict):
     if missing:
         raise ValueError(f"MPS loading requires a complete checkpoint; missing keys: {sorted(missing)}")
     model.load_state_dict(state_dict, strict=False, assign=True)
+    return model
+
+
+class MPSStagingWeights(Mapping):
+    """Detach tensor views from giant flat checkpoint storages before Metal copies."""
+
+    def __init__(self, weights):
+        self.weights = weights
+
+    def __getitem__(self, key):
+        # The released .bin uses views into one 24 GB storage. Without staging,
+        # Metal may map that entire storage when copying even a small parameter.
+        return self.weights[key].clone(memory_format=torch.contiguous_format)
+
+    def __iter__(self):
+        return iter(self.weights)
+
+    def __len__(self):
+        return len(self.weights)
+
+
+def enable_sequential_offload(model, device, preload_module_classes=None):
+    """Keep CPU-backed weights and transfer only the current layer to MPS."""
+    from accelerate import cpu_offload
+
+    device = torch.device(device)
+    state_dict = MPSStagingWeights(model.state_dict()) if device.type == "mps" else None
+    model = cpu_offload(
+        model, execution_device=torch.device(device), offload_buffers=True,
+        state_dict=state_dict,
+        preload_module_classes=preload_module_classes,
+    )
+    if device.type == "mps":
+        # Wait for each streamed block before dropping its cached Metal buffers.
+        # Otherwise queued work can keep previous blocks' allocations alive and
+        # cause heavy unified-memory paging despite the meta parameters.
+        def release_weights(module, args, output):
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+
+        for module in model.modules():
+            is_block = preload_module_classes and module.__class__.__name__ in preload_module_classes
+            is_leaf = preload_module_classes is None and next(module.parameters(recurse=False), None) is not None
+            if is_block or is_leaf:
+                module.register_forward_hook(release_weights)
     return model

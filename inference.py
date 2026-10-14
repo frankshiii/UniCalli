@@ -27,7 +27,9 @@ from pypinyin import lazy_pinyin
 from src.flux.util import configs, load_ae, load_clip, load_t5
 from src.flux.model import Flux
 from src.flux.xflux_pipeline import XFluxSampler
-from src.flux.runtime import resolve_device, validate_optimizations, assign_checkpoint
+from src.flux.runtime import (
+    resolve_device, validate_optimizations, assign_checkpoint, enable_sequential_offload,
+)
 
 
 def convert_to_pinyin(text):
@@ -57,7 +59,8 @@ class CalligraphyGenerator:
         author_descriptions_path: str = "calligraphy_styles_en.json",
         use_deepspeed: bool = False,
         use_4bit_quantization: bool = False,
-        deepspeed_config: Optional[str] = None
+        deepspeed_config: Optional[str] = None,
+        sequential_offload: bool = False,
     ):
         """
         Initialize the calligraphy generator
@@ -73,9 +76,13 @@ class CalligraphyGenerator:
             author_descriptions_path: path to author style descriptions JSON
             use_deepspeed: whether to use DeepSpeed ZeRO for memory optimization
             deepspeed_config: path to DeepSpeed config JSON file
+            sequential_offload: stream individual model blocks to MPS using CPU-backed weights
         """
         self.device = resolve_device(device)
         validate_optimizations(self.device, use_deepspeed, use_4bit_quantization)
+        if sequential_offload and (self.device.type != "mps" or not offload):
+            raise ValueError("Sequential offload currently requires MPS and offload=True.")
+        self.sequential_offload = sequential_offload
         self.model_name = model_name
         self.offload = offload
         self.is_schnell = model_name == "flux-schnell"
@@ -136,7 +143,7 @@ class CalligraphyGenerator:
         self.vae = load_ae(model_name, device=vae_device)
 
         # Move VAE to GPU only if offload (not DeepSpeed)
-        if offload and not self.use_deepspeed:
+        if offload and not self.use_deepspeed and not sequential_offload:
             self.vae = self.vae.to(self.device)
 
         # After DeepSpeed init, move text encoders to GPU
@@ -152,6 +159,15 @@ class CalligraphyGenerator:
             print(f"Loading reference latents from {ref_latent_path}")
             self.ref_latent = torch.load(ref_latent_path, map_location='cpu')
 
+        if sequential_offload:
+            self.model = enable_sequential_offload(
+                self.model, self.device, ["DoubleStreamBlock", "SingleStreamBlock"]
+            )
+            for encoder, blocks in [(self.t5, ["T5Block"]), (self.clip, ["CLIPEncoderLayer"])]:
+                encoder.execution_device = self.device
+                enable_sequential_offload(encoder, self.device, blocks)
+            enable_sequential_offload(self.vae, self.device, ["ResnetBlock", "AttnBlock"])
+
         # Create sampler
         self.sampler = XFluxSampler(
             clip=self.clip,
@@ -161,7 +177,7 @@ class CalligraphyGenerator:
             model=self.model,
             device=self.device,
             intern_vlm_path=intern_vlm_path,
-            offload=offload and not use_deepspeed,
+            offload=offload and not use_deepspeed and not sequential_offload,
         )
 
         # Font for generating condition images
@@ -797,6 +813,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="auto", help="Device: auto, cuda, mps, or cpu")
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path")
     parser.add_argument("--intern-vlm-path", default="./checkpoints/internvl_embedding")
+    parser.add_argument("--sequential-offload", action="store_true", help="Stream model layers to MPS instead of moving the whole model")
     parser.add_argument("--list-authors", action="store_true", help="List available authors")
     parser.add_argument("--list-fonts", action="store_true", help="List available font styles")
 
@@ -808,6 +825,7 @@ if __name__ == "__main__":
         device=args.device,
         checkpoint_path=args.checkpoint,
         intern_vlm_path=args.intern_vlm_path,
+        sequential_offload=args.sequential_offload,
         font_descriptions_path="dataset/chirography.json",
         author_descriptions_path="dataset/calligraphy_styles_en.json",
     )

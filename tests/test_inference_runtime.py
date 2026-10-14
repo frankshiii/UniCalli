@@ -8,6 +8,7 @@ from src.flux.model import Flux, FluxParams
 from src.flux.sampling import get_noise
 from src.flux.xflux_pipeline import XFluxSampler
 from PIL import Image
+from src.flux.runtime import enable_sequential_offload
 
 
 def test_sampler_receives_offload(monkeypatch):
@@ -58,7 +59,8 @@ def test_mps_column_noise_shape():
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
-def test_mps_sampler_repeat_generation_with_offload(monkeypatch):
+@pytest.mark.parametrize("sequential", [False, True])
+def test_mps_sampler_repeat_generation_with_offload(monkeypatch, sequential):
     """Run the actual sampler twice with small random weights and stub encoders."""
     class TextEncoder(torch.nn.Module):
         def __init__(self, shape):
@@ -96,6 +98,11 @@ def test_mps_sampler_repeat_generation_with_offload(monkeypatch):
         TextEncoder((1, 8)), TextEncoder((1, 512, 16)), VAE(),
         None, model, torch.device("mps"), "unused", offload=True,
     )
+    if sequential:
+        sampler.offload = False
+        enable_sequential_offload(model, "mps", ["DoubleStreamBlock", "SingleStreamBlock"])
+        for module in [sampler.t5, sampler.clip, sampler.ae]:
+            enable_sequential_offload(module, "mps")
     results = []
     for _ in range(2):
         image, _ = sampler(
@@ -104,8 +111,43 @@ def test_mps_sampler_repeat_generation_with_offload(monkeypatch):
             num_steps=2, seed=42,
         )
         assert image.size == (128, 640)
-        assert next(sampler.model.parameters()).device.type == "cpu"
-        assert next(sampler.ae.encoder.parameters()).device.type == "cpu"
-        assert next(sampler.ae.decoder.parameters()).device.type == "cpu"
+        offload_device = "meta" if sequential else "cpu"
+        assert next(sampler.model.parameters()).device.type == offload_device
+        assert next(sampler.ae.encoder.parameters()).device.type == offload_device
+        assert next(sampler.ae.decoder.parameters()).device.type == offload_device
         results.append(image.tobytes())
     assert results[0] == results[1]
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+@pytest.mark.parametrize("kind", ["t5", "clip"])
+def test_sequential_text_encoder_uses_execution_device(kind):
+    from transformers import T5Config, T5EncoderModel, CLIPTextConfig, CLIPTextModel
+    from src.flux.modules.conditioner import HFEmbedder
+
+    encoder = HFEmbedder.__new__(HFEmbedder)
+    torch.nn.Module.__init__(encoder)
+    encoder.max_length = 8
+    encoder.tokenizer = lambda *args, **kwargs: {"input_ids": torch.ones(1, 8, dtype=torch.long)}
+    if kind == "t5":
+        encoder.hf_module = T5EncoderModel(T5Config(
+            vocab_size=32, d_model=32, d_ff=64, d_kv=8, num_heads=4, num_layers=1,
+        ))
+        encoder.output_key = "last_hidden_state"
+        blocks = ["T5Block"]
+    else:
+        encoder.hf_module = CLIPTextModel(CLIPTextConfig(
+            vocab_size=32, hidden_size=32, intermediate_size=64,
+            num_hidden_layers=1, num_attention_heads=4, max_position_embeddings=8,
+        ))
+        encoder.output_key = "pooler_output"
+        blocks = ["CLIPEncoderLayer"]
+    encoder.to(torch.bfloat16).eval()
+    with torch.inference_mode():
+        expected = encoder(["test"])
+        encoder.execution_device = torch.device("mps")
+        enable_sequential_offload(encoder, "mps", blocks)
+        result = encoder(["test"])
+    assert result.device.type == "mps"
+    assert torch.isfinite(result).all()
+    torch.testing.assert_close(result.cpu(), expected, rtol=0.05, atol=0.05)

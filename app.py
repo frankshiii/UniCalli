@@ -11,6 +11,7 @@ import os
 from src.flux.runtime import resolve_device
 
 DEVICE = resolve_device(os.environ.get("UNICALLI_DEVICE", "auto"))
+SEQUENTIAL_OFFLOAD = DEVICE.type == "mps" and os.environ.get("UNICALLI_SEQUENTIAL_OFFLOAD", "1") == "1"
 
 # Load author and font mappings from CSV
 def load_author_fonts_from_csv(csv_path):
@@ -79,6 +80,7 @@ def init_generator(use_4bit: bool = False):
             model_name="flux-dev",
             device=DEVICE,
             offload=DEVICE.type == "mps",
+            sequential_offload=SEQUENTIAL_OFFLOAD,
             intern_vlm_path=intern_vlm_path,
             checkpoint_path=checkpoint_path,
             font_descriptions_path='dataset/chirography.json',
@@ -223,9 +225,9 @@ with gr.Blocks(title="UniCalli - Chinese Calligraphy Generator / 中国书法生
             
             num_steps = gr.Slider(
                 label="生成步数 / Inference Steps",
-                minimum=10,
+                minimum=1 if DEVICE.type == "mps" else 10,
                 maximum=100,
-                value=25,
+                value=8 if DEVICE.type == "mps" else 25,
                 step=1,
                 info="更多步数 = 更高质量，但更慢 / More steps = higher quality, but slower"
             )
@@ -309,7 +311,7 @@ with gr.Blocks(title="UniCalli - Chinese Calligraphy Generator / 中国书法生
     gr.Markdown("### 📋 示例 / Examples")
     gr.Examples(
         examples=[
-            ["生日快乐喵", "黄庭坚", "草 (Cursive Script)", 25, 42, False, True],
+            ["生日快乐喵", "黄庭坚", "草 (Cursive Script)", 8 if DEVICE.type == "mps" else 25, 42, False, DEVICE.type == "cuda"],
         ],
         inputs=[
             text_input,

@@ -6,6 +6,7 @@ from src.flux.model import Flux, FluxParams
 from src.flux.runtime import (
     assign_checkpoint, empty_device_cache, resolve_device,
     seeded_random, validate_optimizations,
+    MPSStagingWeights,
 )
 
 
@@ -59,6 +60,22 @@ def test_cpu_seed_unchanged():
     actual = seeded_random((2, 16, 4, 4), "cpu", torch.float32, 42)
     expected = torch.randn(2, 16, 4, 4, generator=torch.Generator().manual_seed(42))
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_mps_staging_bounds_flat_storage(tmp_path):
+    flat = torch.arange(1024, dtype=torch.float32)
+    path = tmp_path / "flat.bin"
+    torch.save({"weight": flat[256:272].view(4, 4)}, path)
+    state = torch.load(path, mmap=True, weights_only=True)
+    original = state["weight"]
+    assert original.untyped_storage().nbytes() > original.numel() * original.element_size()
+    weights = MPSStagingWeights(state)
+    staged = weights["weight"]
+    torch.testing.assert_close(staged, original)
+    assert staged.storage_offset() == 0
+    assert staged.untyped_storage().nbytes() == staged.numel() * staged.element_size()
+    assert list(weights) == ["weight"]
+    assert len(weights) == 1
 
 
 mps_only = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
